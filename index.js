@@ -10,7 +10,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.PHOTOPEA_MCP_PORT || 8787);
+let PORT = Number(process.env.PHOTOPEA_MCP_PORT || 8787); // may move up if taken (see listen below)
 const OUT_DIR = process.env.PHOTOPEA_MCP_OUTPUT || path.join(__dirname, 'output');
 const PEXELS_KEY = process.env.PEXELS_API_KEY || '';
 fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -31,11 +31,10 @@ const httpServer = http.createServer(async (req, res) => {
   }
   res.writeHead(404); res.end();
 });
-httpServer.on('error', (e) => log('http error:', e.message));
-
 // Only the local bridge page may connect (blocks other websites from hijacking the bridge).
-const ALLOWED_ORIGINS = [`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`];
-const wss = new WebSocketServer({ server: httpServer, path: '/ws', verifyClient: ({ origin }) => ALLOWED_ORIGINS.includes(origin) });
+const originOk = (origin) => origin === `http://localhost:${PORT}` || origin === `http://127.0.0.1:${PORT}`;
+const wss = new WebSocketServer({ server: httpServer, path: '/ws', verifyClient: ({ origin }) => originOk(origin) });
+wss.on('error', () => {}); // listen errors are handled by listen() below
 wss.on('connection', (ws) => {
   bridge = ws; peaReady = false;
   log('bridge page connected');
@@ -50,9 +49,23 @@ wss.on('connection', (ws) => {
     for (const [id, p] of pending) { pending.delete(id); p.reject(new Error('bridge page disconnected')); }
   });
 });
-httpServer.listen(PORT, '127.0.0.1', () => log(`bridge at http://localhost:${PORT}`));
 
-const BRIDGE_URL = `http://localhost:${PORT}/`;
+// If the port is taken (another Claude session, a health check), use the next free one instead of crashing.
+let BRIDGE_URL = `http://localhost:${PORT}/`;
+let portTries = 20, tryPort = PORT;
+httpServer.on('error', (e) => {
+  if (e.code === 'EADDRINUSE' && portTries-- > 0) httpServer.listen(++tryPort, '127.0.0.1');
+  else log('http error:', e.message);
+});
+httpServer.on('listening', () => {
+  PORT = httpServer.address().port; BRIDGE_URL = `http://localhost:${PORT}/`;
+  log(`bridge at ${BRIDGE_URL}`);
+});
+httpServer.listen(tryPort, '127.0.0.1');
+
+// Exit when the MCP client goes away, so no orphan server keeps holding the port.
+process.stdin.on('end', () => process.exit(0));
+process.stdin.on('close', () => process.exit(0));
 
 async function launchBrowser() {
   const { spawn } = await import('node:child_process');
@@ -89,6 +102,17 @@ async function runScript(script, timeout = 60000, internal = false) {
   const m = await p;
   if (m.error) throw new Error(m.error + (m.outputs?.length ? ` (output: ${m.outputs.join(' | ')})` : ''));
   return m;
+}
+
+// Render SVG to PNG in the bridge page (real browser engine: filters, masks, patterns, gradients all work).
+async function rasterSvg(svg, w, h, scale = 1) {
+  await waitReady();
+  const id = nextId++;
+  const p = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+  bridge.send(JSON.stringify({ type: 'raster', id, svg, w, h, scale }));
+  const m = await Promise.race([p, new Promise((_, rej) => setTimeout(() => { pending.delete(id); rej(new Error('SVG rendering timed out (is the bridge tab in the foreground?)')); }, 30000))]);
+  if (m.error) throw new Error(m.error);
+  return m.png;
 }
 
 // Run a script body and return the single echoed result (as parsed JSON when possible).
@@ -240,7 +264,8 @@ async function opRect(o) {
 }
 
 async function opText(o, ctx) {
-  const name = o.name || o.text.slice(0, 24);
+  let name = o.name || o.text.slice(0, 24), n = 2; // layer names must be unique within a batch so results/rotation hit the right layer
+  while (ctx.texts.includes(name)) name = `${o.name || o.text.slice(0, 24)} #${n++}`;
   const just = { left: 'LEFT', center: 'CENTER', right: 'RIGHT' }[o.align || 'left'];
   await evalJs(`
     var d=app.activeDocument; var pt=${o.size ?? 48}*72/d.resolution;
@@ -248,13 +273,17 @@ async function opText(o, ctx) {
     t.contents=${J(o.text)}; t.size=pt; t.font=${J(o.font || 'ArialMT')};
     var c=new SolidColor(); c.rgb.hexValue=${J(hex(o.color || '#000000'))}; t.color=c;
     t.justification=Justification.${just}; t.position=[${o.x},${o.y}];
+    ${o.tracking !== undefined ? `try{t.tracking=${o.tracking};}catch(e){}` : ''}
+    ${o.lineHeight !== undefined ? `try{t.useAutoLeading=false; t.leading=${o.lineHeight}*72/d.resolution;}catch(e){}` : ''}
+    ${o.opacity !== undefined ? `l.opacity=${o.opacity};` : ''}
     l.name=${J(name)};`);
   ctx.texts.push(name); // layout finishes asynchronously; verified once at the end of the batch
+  if (o.rotate) ctx.rots.push([name, o.rotate]);
   return 'text';
 }
 
 async function opImage(o) {
-  const dataUrl = await toDataUrl(rightSize(o.url, o.w, o.h));
+  const dataUrl = o.dataUrl || await toDataUrl(rightSize(o.url, o.w, o.h));
   const m = await runScript(`app.echoToOE(String(app.activeDocument.layers.length)); app.open(${J(dataUrl)}, null, true);`, 90000);
   const before = Number(m.outputs[0]);
   await waitFor(async () => (await evalJs(`return app.activeDocument.layers.length;`)) > before, 'the image to load (check the URL)');
@@ -264,13 +293,28 @@ async function opImage(o) {
     var tw=${o.w ?? 'null'}, th=${o.h ?? 'null'}, s;
     if(tw!==null && th!==null){ s = ${J(o.fit || 'contain')}==='cover' ? Math.max(tw/w,th/h) : Math.min(tw/w,th/h); }
     else if(tw!==null) s=tw/w; else if(th!==null) s=th/h; else s=1;
-    if(s!==1) l.resize(s*100, s*100, AnchorPosition.TOPLEFT);
+    if(Math.abs(s-1)>0.002) l.resize(s*100, s*100, AnchorPosition.TOPLEFT);
     b=l.bounds; var nw=b[2].value-b[0].value, nh=b[3].value-b[1].value;
     var ox=${o.x ?? 0}, oy=${o.y ?? 0};
     if(tw!==null && th!==null){ ox += (tw-nw)/2; oy += (th-nh)/2; }
     l.translate(ox-b[0].value, oy-b[1].value);
+    ${o.rotate ? `l.rotate(${o.rotate}, AnchorPosition.MIDDLECENTER);` : ''}
+    ${o.opacity !== undefined ? `l.opacity=${o.opacity};` : ''}
     ${o.name ? `l.name=${J(o.name)};` : ''}
     b=l.bounds; return ${bounds4};`);
+}
+
+// Inline SVG as a raster layer: gradients, rounded rects, blur, shadows, glass panels. A near-invisible full-size rect
+// keeps transparent margins inside the layer bounds so x,y,w,h map exactly onto the canvas.
+function opSvg(o) {
+  let svg = o.svg.trim();
+  if (!/^<svg[\s>]/i.test(svg)) throw new Error('svg must start with <svg');
+  svg = svg.replace(/<svg\b([^>]*)>/i, (m, attrs) => {
+    const vb = /viewBox=/i.test(attrs) ? '' : ` viewBox="0 0 ${o.w} ${o.h}"`;
+    const clean = attrs.replace(/\s(width|height)="[^"]*"/gi, '').replace(/\sxmlns="[^"]*"/i, '');
+    return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"${clean}${vb} width="${o.w}" height="${o.h}"><rect width="100%" height="100%" fill="#fff" fill-opacity="0.004"/>`;
+  });
+  return rasterSvg(svg, o.w, o.h, o.scale).then((png) => opImage({ dataUrl: `data:image/png;base64,${png}`, x: o.x ?? 0, y: o.y ?? 0, w: o.w, h: o.h, name: o.name || 'svg', rotate: o.rotate, opacity: o.opacity }));
 }
 
 const opIcon = (o) => {
@@ -281,20 +325,21 @@ const opIcon = (o) => {
 const ICON = z.string().regex(/^[a-z0-9-]+:[a-z0-9-]+$/);
 const OP = z.discriminatedUnion('type', [
   z.object({ type: z.literal('rect'), x: z.number(), y: z.number(), w: z.number(), h: z.number(), color: z.string(), opacity: z.number().optional(), name: z.string().optional() }),
-  z.object({ type: z.literal('text'), text: z.string(), x: z.number(), y: z.number(), size: z.number().optional().describe('px, default 48'), color: z.string().optional(), font: z.string().optional().describe('PostScript name, e.g. Arial-BoldMT, Impact, Georgia-Bold'), align: z.enum(['left', 'center', 'right']).optional().describe('x is the left/center/right anchor; y is the baseline'), name: z.string().optional() }),
-  z.object({ type: z.literal('image'), url: z.string().url(), x: z.number().optional(), y: z.number().optional(), w: z.number().optional(), h: z.number().optional(), fit: z.enum(['contain', 'cover']).optional().describe('with both w,h: contain=inside box (default), cover=fills box and overflows'), name: z.string().optional() }),
+  z.object({ type: z.literal('text'), text: z.string(), x: z.number(), y: z.number(), size: z.number().optional().describe('px, default 48'), color: z.string().optional(), font: z.string().optional().describe('PostScript name, e.g. Arial-BoldMT, Impact, Georgia-Bold'), align: z.enum(['left', 'center', 'right']).optional().describe('x is the left/center/right anchor; y is the baseline'), tracking: z.number().optional().describe('letter spacing, 1/1000 em (negative = tighter)'), lineHeight: z.number().optional().describe('px, for multi-line text (use \\n in text)'), rotate: z.number().optional().describe('degrees clockwise about the text center'), opacity: z.number().optional(), name: z.string().optional() }),
+  z.object({ type: z.literal('image'), url: z.string().url(), x: z.number().optional(), y: z.number().optional(), w: z.number().optional(), h: z.number().optional(), fit: z.enum(['contain', 'cover']).optional().describe('with both w,h: contain=inside box (default), cover=fills box and overflows'), rotate: z.number().optional().describe('degrees clockwise about center'), opacity: z.number().optional(), name: z.string().optional() }),
+  z.object({ type: z.literal('svg'), svg: z.string().describe('full <svg>...</svg> markup; rendered by the browser, so gradients, filters (blur/drop-shadow), masks, patterns, rounded rects all work. No external resources.'), scale: z.number().optional().describe('render at Nx resolution then fit to w,h (default 1)'), x: z.number().optional(), y: z.number().optional(), w: z.number(), h: z.number(), rotate: z.number().optional(), opacity: z.number().optional(), name: z.string().optional() }),
   z.object({ type: z.literal('icon'), icon: ICON.describe('Iconify "prefix:name"'), color: z.string().optional(), size: z.number().optional(), x: z.number().optional(), y: z.number().optional(), name: z.string().optional() }),
 ]);
 
 server.registerTool('photopea_compose', {
-  description: 'Add many elements to the active document in ONE call, applied in order (later ops stack on top). Coordinates are px from top-left. Returns image/icon/text bounds [x0,y0,x1,y1] for verification.',
+  description: 'Add many elements to the active document in ONE call, applied in order (later ops stack on top). Coordinates are px from top-left. Ops: rect, text, image (URL), icon (Iconify), svg (inline markup for gradients/rounded/blur/shadow/glass). Returns bounds [x0,y0,x1,y1] for verification.',
   inputSchema: { ops: z.array(OP).min(1).max(40) },
 }, tool(async ({ ops }) => {
-  const ctx = { texts: [] }, res = [];
+  const ctx = { texts: [], rots: [] }, res = [];
   for (let i = 0; i < ops.length; i++) {
     const o = ops[i];
     try {
-      res.push(o.type === 'rect' ? await opRect(o) : o.type === 'text' ? await opText(o, ctx) : o.type === 'image' ? await opImage(o) : await opIcon(o));
+      res.push(o.type === 'rect' ? await opRect(o) : o.type === 'text' ? await opText(o, ctx) : o.type === 'image' ? await opImage(o) : o.type === 'svg' ? await opSvg(o) : await opIcon(o));
     } catch (e) {
       return fail(new Error(`op ${i} (${o.type}) failed: ${e.message}. Ops 0-${i - 1} were applied.`));
     }
@@ -307,6 +352,15 @@ server.registerTool('photopea_compose', {
         return out;`);
       return ctx.texts.every((n) => r[n] && r[n][2] > r[n][0]) ? r : null;
     }, 'text to render (check font names)', 30000);
+    if (ctx.rots.length) {
+      await evalJs(`var R=${J(ctx.rots)}, d=app.activeDocument;
+        for(var k=0;k<R.length;k++) for(var i=0;i<d.layers.length;i++){ if(d.layers[i].name===R[k][0]){ d.layers[i].rotate(R[k][1], AnchorPosition.MIDDLECENTER); break; } }
+        return 1;`);
+      await sleep(300);
+      Object.assign(info, await evalJs(`var want=${names}, out={}, d=app.activeDocument;
+        for(var i=0;i<d.layers.length;i++){var l=d.layers[i]; if(want.indexOf(l.name)>=0 && !(l.name in out)){var b=l.bounds; out[l.name]=${bounds4};}}
+        return out;`));
+    }
     let k = 0;
     for (let i = 0; i < ops.length; i++) if (ops[i].type === 'text') res[i] = info[ctx.texts[k++]];
   }
