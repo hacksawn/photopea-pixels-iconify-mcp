@@ -4,7 +4,7 @@
   "description": "MCP server to build posters in Photopea with Pexels photos and Iconify icons",
   "main": "index.js",
   "scripts": {
-    "test": "node test/test.mjs && node test/test-pexels.mjs && node test/test-autoopen.mjs && node test/test-autosave.mjs && node test/test-portfallback.mjs && node test/test-svg.mjs"
+    "test": "node test/test.mjs && node test/test-pexels.mjs && node test/test-autoopen.mjs && node test/test-autosave.mjs && node test/test-portfallback.mjs && node test/test-svg.mjs && node test/test-layers.mjs"
   },
   "keywords": [],
   "type": "module",

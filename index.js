@@ -299,6 +299,7 @@ async function opImage(o) {
     if(tw!==null && th!==null){ ox += (tw-nw)/2; oy += (th-nh)/2; }
     l.translate(ox-b[0].value, oy-b[1].value);
     ${o.rotate ? `l.rotate(${o.rotate}, AnchorPosition.MIDDLECENTER);` : ''}
+    ${o.flatten ? 'try{ l.rasterize(RasterizeType.ENTIRELAYER); }catch(e){}' : ''}
     ${o.opacity !== undefined ? `l.opacity=${o.opacity};` : ''}
     ${o.name ? `l.name=${J(o.name)};` : ''}
     b=l.bounds; return ${bounds4};`);
@@ -314,7 +315,7 @@ function opSvg(o) {
     const clean = attrs.replace(/\s(width|height)="[^"]*"/gi, '').replace(/\sxmlns="[^"]*"/i, '');
     return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"${clean}${vb} width="${o.w}" height="${o.h}"><rect width="100%" height="100%" fill="#fff" fill-opacity="0.004"/>`;
   });
-  return rasterSvg(svg, o.w, o.h, o.scale).then((png) => opImage({ dataUrl: `data:image/png;base64,${png}`, x: o.x ?? 0, y: o.y ?? 0, w: o.w, h: o.h, name: o.name || 'svg', rotate: o.rotate, opacity: o.opacity }));
+  return rasterSvg(svg, o.w, o.h, o.scale).then((png) => opImage({ dataUrl: `data:image/png;base64,${png}`, x: o.x ?? 0, y: o.y ?? 0, w: o.w, h: o.h, name: o.name || 'svg', rotate: o.rotate, opacity: o.opacity, flatten: o.flatten }));
 }
 
 const opIcon = (o) => {
@@ -327,7 +328,7 @@ const OP = z.discriminatedUnion('type', [
   z.object({ type: z.literal('rect'), x: z.number(), y: z.number(), w: z.number(), h: z.number(), color: z.string(), opacity: z.number().optional(), name: z.string().optional() }),
   z.object({ type: z.literal('text'), text: z.string(), x: z.number(), y: z.number(), size: z.number().optional().describe('px, default 48'), color: z.string().optional(), font: z.string().optional().describe('PostScript name, e.g. Arial-BoldMT, Impact, Georgia-Bold'), align: z.enum(['left', 'center', 'right']).optional().describe('x is the left/center/right anchor; y is the baseline'), tracking: z.number().optional().describe('letter spacing, 1/1000 em (negative = tighter)'), lineHeight: z.number().optional().describe('px, for multi-line text (use \\n in text)'), rotate: z.number().optional().describe('degrees clockwise about the text center'), opacity: z.number().optional(), name: z.string().optional() }),
   z.object({ type: z.literal('image'), url: z.string().url(), x: z.number().optional(), y: z.number().optional(), w: z.number().optional(), h: z.number().optional(), fit: z.enum(['contain', 'cover']).optional().describe('with both w,h: contain=inside box (default), cover=fills box and overflows'), rotate: z.number().optional().describe('degrees clockwise about center'), opacity: z.number().optional(), name: z.string().optional() }),
-  z.object({ type: z.literal('svg'), svg: z.string().describe('full <svg>...</svg> markup; rendered by the browser, so gradients, filters (blur/drop-shadow), masks, patterns, rounded rects all work. No external resources.'), scale: z.number().optional().describe('render at Nx resolution then fit to w,h (default 1)'), x: z.number().optional(), y: z.number().optional(), w: z.number(), h: z.number(), rotate: z.number().optional(), opacity: z.number().optional(), name: z.string().optional() }),
+  z.object({ type: z.literal('svg'), svg: z.string().describe('full <svg>...</svg> markup; rendered by the browser, so gradients, filters (blur/drop-shadow), masks, patterns, rounded rects all work. No external resources.'), scale: z.number().optional().describe('render at Nx resolution then fit to w,h (default 1)'), x: z.number().optional(), y: z.number().optional(), w: z.number(), h: z.number(), rotate: z.number().optional(), opacity: z.number().optional(), flatten: z.boolean().optional().describe('rasterize to a plain pixel layer instead of a smart object'), name: z.string().optional() }),
   z.object({ type: z.literal('icon'), icon: ICON.describe('Iconify "prefix:name"'), color: z.string().optional(), size: z.number().optional(), x: z.number().optional(), y: z.number().optional(), name: z.string().optional() }),
 ]);
 
@@ -336,6 +337,8 @@ server.registerTool('photopea_compose', {
   inputSchema: { ops: z.array(OP).min(1).max(40) },
 }, tool(async ({ ops }) => {
   const ctx = { texts: [], rots: [] }, res = [];
+  // Photopea inserts new layers above the ACTIVE layer, so make the top layer active first: ops then really stack on top.
+  await evalJs(`var d=app.activeDocument; if(d.layers.length) d.activeLayer=d.layers[0]; return 1;`);
   for (let i = 0; i < ops.length; i++) {
     const o = ops[i];
     try {
@@ -390,7 +393,8 @@ server.registerTool('photopea_layer_edit', {
   ${a.visible !== undefined ? `l.visible=${a.visible};` : ''}
   ${a.opacity !== undefined ? `l.opacity=${a.opacity};` : ''}
   ${a.dx !== undefined || a.dy !== undefined ? `l.translate(${a.dx || 0}, ${a.dy || 0});` : ''}
-  ${a.order ? `l.move(d, ${a.order === 'top' ? 'ElementPlacement.PLACEATBEGINNING' : 'ElementPlacement.PLACEATEND'});` : ''}`}
+  ${a.order === 'top' ? `if(d.layers[0]!==l) l.move(d.layers[0], ElementPlacement.PLACEBEFORE);` : ''}
+  ${a.order === 'bottom' ? `if(d.layers[d.layers.length-1]!==l) l.move(d.layers[d.layers.length-1], ElementPlacement.PLACEAFTER);` : ''}`}
   return 1;`);
   return text('ok');
 }));
