@@ -41,7 +41,7 @@ wss.on('connection', (ws) => {
   log('bridge page connected');
   ws.on('message', (raw) => {
     const m = JSON.parse(raw);
-    if (m.type === 'photopea-ready') { peaReady = true; return; }
+    if (m.type === 'photopea-ready') { peaReady = true; restoring = maybeRestore(); return; }
     const p = pending.get(m.id);
     if (p) { pending.delete(m.id); p.resolve(m); }
   });
@@ -80,8 +80,9 @@ async function waitReady(ms = 40000) {
   }
 }
 
-async function runScript(script, timeout = 60000) {
+async function runScript(script, timeout = 60000, internal = false) {
   await waitReady();
+  if (!internal) await restoring;
   const id = nextId++;
   const p = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
   bridge.send(JSON.stringify({ type: 'script', id, script, timeout }));
@@ -91,9 +92,9 @@ async function runScript(script, timeout = 60000) {
 }
 
 // Run a script body and return the single echoed result (as parsed JSON when possible).
-async function evalJs(body, timeout) {
+async function evalJs(body, timeout, internal = false) {
   const wrapped = `try { var __r = (function(){ ${body} })(); app.echoToOE(JSON.stringify({ok:true, result:__r})); } catch(e) { app.echoToOE(JSON.stringify({ok:false, error:String(e)})); }`;
-  const m = await runScript(wrapped, timeout);
+  const m = await runScript(wrapped, timeout, internal);
   const line = m.outputs.find((o) => o.startsWith('{')) ;
   if (!line) throw new Error('Photopea returned no result. Output: ' + JSON.stringify(m.outputs));
   const j = JSON.parse(line);
@@ -105,7 +106,8 @@ const J = (v) => JSON.stringify(v);
 const hex = (c) => String(c).replace('#', '');
 const text = (v) => ({ content: [{ type: 'text', text: typeof v === 'string' ? v : JSON.stringify(v) }] });
 const fail = (e) => ({ isError: true, content: [{ type: 'text', text: String(e.message || e) }] });
-const tool = (fn) => async (args) => { try { return await fn(args); } catch (e) { return fail(e); } };
+let busy = 0; // MCP tool calls in flight; autosave waits for them
+const tool = (fn) => async (args) => { busy++; try { return await fn(args); } catch (e) { return fail(e); } finally { busy--; } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const NUM = `function __n(v){return (v && v.value!==undefined) ? v.value : v;}`;
 
@@ -140,6 +142,59 @@ async function waitFor(check, what, ms = 45000) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) { const v = await check(); if (v) return v; await sleep(150); }
   throw new Error(`Timed out waiting for ${what}`);
+}
+
+// ---------------------------------------------------------------- autosave / restore
+// Saves the open document as a PSD every few seconds (only when it changed, including manual edits in the
+// Photopea tab) and reopens the newest snapshot when a fresh Photopea page connects with nothing open.
+const AUTOSAVE = process.env.PHOTOPEA_MCP_AUTOSAVE !== '0';
+const AUTOSAVE_SECS = Math.max(1, Number(process.env.PHOTOPEA_MCP_AUTOSAVE_SECS || 15));
+const SAVE_DIR = path.join(OUT_DIR, 'autosave');
+const KEEP_SNAPSHOTS = 10, SNAPSHOT_EVERY_MS = 60000;
+let lastFp = null, lastSnapshotAt = 0, saving = false, restoring = Promise.resolve();
+
+const FINGERPRINT = `if(app.documents.length==0) return null; var d=app.activeDocument, f=[d.name,d.width,d.height,d.historyStates?d.historyStates.length:0];
+  for(var i=0;i<d.layers.length;i++){var l=d.layers[i],b=l.bounds; f.push(l.name,l.visible?1:0,l.opacity,b[0].value,b[1].value,b[2].value,b[3].value);}
+  return f.join('|');`;
+
+const snapshots = () => (fs.existsSync(SAVE_DIR) ? fs.readdirSync(SAVE_DIR).filter((f) => /^autosave-.*\.psd$/.test(f)).sort() : []);
+
+async function autosaveTick() {
+  if (!AUTOSAVE || saving || busy || !(bridge && peaReady)) return;
+  saving = true;
+  try {
+    const fp = await evalJs(FINGERPRINT, undefined, true);
+    if (!fp || fp === lastFp) return; // nothing open (never overwrite a good snapshot) or unchanged
+    const m = await runScript(`app.activeDocument.saveToOE("psd");`, 60000, true);
+    if (!m.buffers.length) return;
+    fs.mkdirSync(SAVE_DIR, { recursive: true });
+    const existing = snapshots();
+    const now = Date.now();
+    // new snapshot file at most once a minute; otherwise refresh the newest one
+    const file = existing.length && now - lastSnapshotAt < SNAPSHOT_EVERY_MS
+      ? existing[existing.length - 1]
+      : `autosave-${new Date(now).toISOString().replace(/[:.]/g, '-')}.psd`;
+    if (file !== existing[existing.length - 1]) lastSnapshotAt = now;
+    fs.writeFileSync(path.join(SAVE_DIR, file), Buffer.from(m.buffers[0], 'base64'));
+    lastFp = fp;
+    for (const old of snapshots().slice(0, -KEEP_SNAPSHOTS)) fs.unlinkSync(path.join(SAVE_DIR, old));
+  } catch (e) { log('autosave skipped:', e.message); } finally { saving = false; }
+}
+if (AUTOSAVE) setInterval(autosaveTick, AUTOSAVE_SECS * 1000).unref();
+
+async function maybeRestore() {
+  if (!AUTOSAVE) return;
+  try {
+    const latest = snapshots().pop();
+    if (!latest) return;
+    const docs = await evalJs(`return app.documents.length;`, undefined, true);
+    if (docs !== 0) return; // page already has work open (e.g. server restarted); leave it alone
+    const dataUrl = `data:application/octet-stream;base64,${fs.readFileSync(path.join(SAVE_DIR, latest)).toString('base64')}`;
+    await runScript(`app.open(${J(dataUrl)});`, 90000, true);
+    await waitFor(async () => (await evalJs(`return app.documents.length;`, undefined, true)) > 0, 'the autosaved document to open');
+    lastFp = null; lastSnapshotAt = Date.now();
+    log('restored', latest);
+  } catch (e) { log('restore failed:', e.message); }
 }
 
 // ---------------------------------------------------------------- server
