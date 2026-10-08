@@ -1,0 +1,16 @@
+{
+  "name": "photopea-mcp",
+  "version": "1.0.0",
+  "description": "MCP server to build posters in Photopea with Pexels photos and Iconify icons",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/test.mjs && node test/test-pexels.mjs && node test/test-autoopen.mjs"
+  },
+  "keywords": [],
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
+  }
+}

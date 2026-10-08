@@ -1,0 +1,60 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Photopea MCP Bridge</title>
+<style>
+html,body{margin:0;height:100%;background:#222;color:#ddd;font:13px sans-serif}
+#bar{height:26px;line-height:26px;padding:0 10px;background:#111}
+#bar b.ok{color:#6c6}#bar b.bad{color:#e66}
+iframe{width:100%;height:calc(100% - 26px);border:0}
+</style></head><body>
+<div id="bar">Photopea MCP bridge — server: <b id="ws" class="bad">disconnected</b> · photopea: <b id="pp" class="bad">loading</b></div>
+<iframe id="pea" src="https://www.photopea.com#%7B%22environment%22%3A%7B%22theme%22%3A0%7D%7D"></iframe>
+<script>
+const pea = document.getElementById('pea');
+const $ws = document.getElementById('ws'), $pp = document.getElementById('pp');
+let ws, ppReady = false, current = null;
+const queue = [];
+
+function flag(el, ok, text){ el.textContent = text; el.className = ok ? 'ok' : 'bad'; }
+function b64(buf){
+  const u = new Uint8Array(buf); let s = '';
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+window.addEventListener('message', (e) => {
+  if (e.source !== pea.contentWindow) return;
+  if (!ppReady) { ppReady = true; flag($pp, true, 'ready'); send({type:'photopea-ready'}); }
+  if (!current) return;
+  if (e.data === 'done') {
+    const c = current; current = null; clearTimeout(c.timer);
+    send({id: c.id, outputs: c.outputs, buffers: c.buffers});
+    pump();
+  } else if (typeof e.data === 'string') current.outputs.push(e.data);
+  else if (e.data instanceof ArrayBuffer) current.buffers.push(b64(e.data));
+});
+
+function pump(){
+  if (current || !queue.length || !ppReady) return;
+  current = queue.shift();
+  current.outputs = []; current.buffers = [];
+  current.timer = setTimeout(() => {
+    if (!current) return;
+    const c = current; current = null;
+    send({id: c.id, error: 'timeout waiting for Photopea', outputs: c.outputs});
+    pump();
+  }, current.timeout || 60000);
+  pea.contentWindow.postMessage(current.script, '*');
+}
+function send(o){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+function connect(){
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.onopen = () => { flag($ws, true, 'connected'); if (ppReady) send({type:'photopea-ready'}); };
+  ws.onclose = () => { flag($ws, false, 'disconnected'); setTimeout(connect, 1000); };
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.type === 'script') { queue.push({id: msg.id, script: msg.script, timeout: msg.timeout}); pump(); }
+  };
+}
+connect();
+</script></body></html>
