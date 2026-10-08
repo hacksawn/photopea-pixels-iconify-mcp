@@ -4,7 +4,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WebSocketServer } from 'ws';
+import { spawn } from 'node:child_process';
+import { WebSocketServer, WebSocket } from 'ws';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -18,57 +19,134 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 const log = (...a) => console.error('[photopea-mcp]', ...a); // stdout is reserved for MCP
 
 // ---------------------------------------------------------------- bridge
-let bridge = null; // active WebSocket from the bridge page
-let peaReady = false;
-const pending = new Map();
+// One process hosts the bridge page (the Photopea tab) on the base port. Any other MCP server process (another Claude session,
+// a health check, a script) finds the host on that port and SHARES its tab through /api instead of starting a second bridge.
+// If the host exits, a waiting process takes over the same port and the tab reconnects by itself.
+let isHost = false;
+let bridge = null, peaReady = false;                              // host: the Photopea page
+let hostLink = null, remoteUp = false, remoteConnected = false;   // client: the host we share
+const pending = new Map();                                        // our own in-flight requests
+const relayed = new Map();                                        // host: requests forwarded on behalf of clients
+const apiClients = new Set();
 let nextId = 1;
 
-const httpServer = http.createServer(async (req, res) => {
+const pageUp = () => (isHost ? !!(bridge && peaReady) : remoteUp);
+const pageConnected = () => (isHost ? !!bridge : remoteConnected);
+function sendToPage(msg) {
+  const target = isHost ? bridge : hostLink;
+  if (!target || target.readyState !== 1) throw new Error('Photopea bridge is not connected');
+  target.send(JSON.stringify(msg));
+}
+const stateMsg = () => JSON.stringify({ type: 'state', connected: !!bridge, ready: !!(bridge && peaReady) });
+const broadcastState = () => { for (const c of apiClients) if (c.readyState === 1) c.send(stateMsg()); };
+
+const httpServer = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (url.pathname === '/' || url.pathname === '/bridge.html') {
     res.writeHead(200, { 'content-type': 'text/html' });
     return res.end(fs.readFileSync(path.join(__dirname, 'public', 'bridge.html')));
   }
+  if (url.pathname === '/__id') { // lets other instances recognise a running host
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ app: 'photopea-mcp', pid: process.pid }));
+  }
   res.writeHead(404); res.end();
 });
-// Only the local bridge page may connect (blocks other websites from hijacking the bridge).
+httpServer.on('error', (e) => { if (e.code !== 'EADDRINUSE') log('http error:', e.message); });
+
+// /ws = the Photopea page (browsers always send an Origin; it must be our own page, so other websites cannot hijack the bridge)
+// /api = other MCP server processes sharing this bridge (a browser always sends an Origin, so web pages cannot use it)
 const originOk = (origin) => origin === `http://localhost:${PORT}` || origin === `http://127.0.0.1:${PORT}`;
-const wss = new WebSocketServer({ server: httpServer, path: '/ws', verifyClient: ({ origin }) => originOk(origin) });
-wss.on('error', () => {}); // listen errors are handled by listen() below
-wss.on('connection', (ws) => {
-  bridge = ws; peaReady = false;
+const pageWss = new WebSocketServer({ noServer: true });
+const apiWss = new WebSocketServer({ noServer: true });
+httpServer.on('upgrade', (req, socket, head) => {
+  const p = new URL(req.url, 'http://x').pathname;
+  const wss = p === '/ws' && originOk(req.headers.origin) ? pageWss : p === '/api' && !req.headers.origin ? apiWss : null;
+  if (!wss) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); return socket.destroy(); }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+
+pageWss.on('connection', (ws) => {
+  bridge = ws; peaReady = false;           // newest tab wins; an older tab just idles
   log('bridge page connected');
+  broadcastState();
   ws.on('message', (raw) => {
     const m = JSON.parse(raw);
-    if (m.type === 'photopea-ready') { peaReady = true; restoring = maybeRestore(); return; }
+    if (m.type === 'photopea-ready') { peaReady = true; broadcastState(); restoring = maybeRestore(); return; }
+    const r = relayed.get(m.id);
+    if (r) { relayed.delete(m.id); if (r.ws.readyState === 1) r.ws.send(JSON.stringify({ ...m, id: r.id })); return; }
     const p = pending.get(m.id);
     if (p) { pending.delete(m.id); p.resolve(m); }
   });
   ws.on('close', () => {
-    if (bridge === ws) { bridge = null; peaReady = false; }
+    if (bridge !== ws) return;
+    bridge = null; peaReady = false; broadcastState();
     for (const [id, p] of pending) { pending.delete(id); p.reject(new Error('bridge page disconnected')); }
+    for (const [hid, r] of relayed) { relayed.delete(hid); if (r.ws.readyState === 1) r.ws.send(JSON.stringify({ id: r.id, error: 'bridge page disconnected' })); }
   });
 });
 
-// If the port is taken (another Claude session, a health check), use the next free one instead of crashing.
+apiWss.on('connection', (ws) => {
+  apiClients.add(ws);
+  ws.send(stateMsg());
+  ws.on('message', (raw) => {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.type === 'launch') return maybeLaunch();
+    if (!bridge || bridge.readyState !== 1) return ws.send(JSON.stringify({ id: m.id, error: 'bridge page disconnected' }));
+    const hid = nextId++;
+    relayed.set(hid, { ws, id: m.id });
+    bridge.send(JSON.stringify({ ...m, id: hid }));
+  });
+  ws.on('close', () => { apiClients.delete(ws); for (const [hid, r] of relayed) if (r.ws === ws) relayed.delete(hid); });
+});
+
 let BRIDGE_URL = `http://localhost:${PORT}/`;
-let portTries = 20, tryPort = PORT;
-httpServer.on('error', (e) => {
-  if (e.code === 'EADDRINUSE' && portTries-- > 0) httpServer.listen(++tryPort, '127.0.0.1');
-  else log('http error:', e.message);
+const setPort = (p) => { PORT = p; BRIDGE_URL = `http://localhost:${PORT}/`; };
+
+const tryListen = (p) => new Promise((resolve) => {
+  const onErr = (e) => { httpServer.removeListener('listening', onOk); resolve(e.code === 'EADDRINUSE' ? 'busy' : 'error'); };
+  const onOk = () => { httpServer.removeListener('error', onErr); resolve('host'); };
+  httpServer.once('error', onErr); httpServer.once('listening', onOk);
+  httpServer.listen(p, '127.0.0.1');
 });
-httpServer.on('listening', () => {
-  PORT = httpServer.address().port; BRIDGE_URL = `http://localhost:${PORT}/`;
-  log(`bridge at ${BRIDGE_URL}`);
-});
-httpServer.listen(tryPort, '127.0.0.1');
+const isOurHost = async (p) => {
+  try { const r = await fetch(`http://127.0.0.1:${p}/__id`, { signal: AbortSignal.timeout(1500) }); return (await r.json()).app === 'photopea-mcp'; }
+  catch { return false; }
+};
+function connectAsClient(p) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${p}/api`);
+    let opened = false;
+    ws.on('open', () => { opened = true; hostLink = ws; resolve(true); });
+    ws.on('error', () => { if (!opened) resolve(false); });
+    ws.on('message', (raw) => {
+      const m = JSON.parse(raw);
+      if (m.type === 'state') { remoteConnected = m.connected; remoteUp = m.connected && m.ready; return; }
+      const pr = pending.get(m.id);
+      if (pr) { pending.delete(m.id); pr.resolve(m); }
+    });
+    ws.on('close', () => {
+      if (hostLink !== ws) return;
+      hostLink = null; remoteUp = false; remoteConnected = false;
+      for (const [id, pr] of pending) { pending.delete(id); pr.reject(new Error('bridge host went away')); }
+      setTimeout(() => start(PORT), 300 + Math.random() * 700); // take over the port (or join whoever did)
+    });
+  });
+}
+async function start(base) {
+  for (let p = base; p < base + 20; p++) {
+    if (await tryListen(p) === 'host') { isHost = true; setPort(p); log(`bridge at ${BRIDGE_URL}`); startAutosave(); return; }
+    if (await isOurHost(p) && await connectAsClient(p)) { isHost = false; setPort(p); log(`sharing the bridge at ${BRIDGE_URL}`); return; }
+    // port taken by something else: try the next one
+  }
+  log('no usable port found');
+}
 
 // Exit when the MCP client goes away, so no orphan server keeps holding the port.
 process.stdin.on('end', () => process.exit(0));
 process.stdin.on('close', () => process.exit(0));
 
-async function launchBrowser() {
-  const { spawn } = await import('node:child_process');
+function launchBrowser() {
   const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
   const args = process.platform === 'win32' ? ['/c', 'start', BRIDGE_URL] : [BRIDGE_URL];
   const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
@@ -76,16 +154,23 @@ async function launchBrowser() {
   child.unref();
 }
 
-let lastLaunch = 0;
+// Open the bridge in the browser when no page is connected (at most once per 30s, only the host launches).
+let lastLaunch = 0, lastAsk = 0;
+function maybeLaunch(force = false) {
+  if (!isHost || bridge) return;
+  if (!force && (process.env.PHOTOPEA_MCP_AUTOOPEN === '0' || Date.now() - lastLaunch < 30000)) return;
+  lastLaunch = Date.now(); log('opening bridge in browser'); launchBrowser();
+}
+function requestLaunch(force = false) {
+  if (isHost) return maybeLaunch(force);
+  if (Date.now() - lastAsk < 5000 || !hostLink || hostLink.readyState !== 1) return;
+  lastAsk = Date.now(); hostLink.send(JSON.stringify({ type: 'launch' }));
+}
+
 async function waitReady(ms = 40000) {
   const t0 = Date.now();
-  while (!(bridge && peaReady)) {
-    // No bridge tab yet: open one automatically (at most once per 30s) unless disabled.
-    if (!bridge && process.env.PHOTOPEA_MCP_AUTOOPEN !== '0' && Date.now() - lastLaunch > 30000) {
-      lastLaunch = Date.now();
-      log('opening bridge in browser');
-      await launchBrowser();
-    }
+  while (!pageUp()) {
+    if (!pageConnected()) requestLaunch();
     if (Date.now() - t0 > ms) {
       throw new Error(`Photopea bridge is not connected. Open ${BRIDGE_URL} in a browser tab, wait for both indicators to turn green, then retry.`);
     }
@@ -98,7 +183,7 @@ async function runScript(script, timeout = 60000, internal = false) {
   if (!internal) await restoring;
   const id = nextId++;
   const p = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
-  bridge.send(JSON.stringify({ type: 'script', id, script, timeout }));
+  sendToPage({ type: 'script', id, script, timeout });
   const m = await p;
   if (m.error) throw new Error(m.error + (m.outputs?.length ? ` (output: ${m.outputs.join(' | ')})` : ''));
   return m;
@@ -109,7 +194,7 @@ async function rasterSvg(svg, w, h, scale = 1) {
   await waitReady();
   const id = nextId++;
   const p = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
-  bridge.send(JSON.stringify({ type: 'raster', id, svg, w, h, scale }));
+  sendToPage({ type: 'raster', id, svg, w, h, scale });
   const m = await Promise.race([p, new Promise((_, rej) => setTimeout(() => { pending.delete(id); rej(new Error('SVG rendering timed out (is the bridge tab in the foreground?)')); }, 30000))]);
   if (m.error) throw new Error(m.error);
   return m.png;
@@ -184,7 +269,7 @@ const FINGERPRINT = `if(app.documents.length==0) return null; var d=app.activeDo
 const snapshots = () => (fs.existsSync(SAVE_DIR) ? fs.readdirSync(SAVE_DIR).filter((f) => /^autosave-.*\.psd$/.test(f)).sort() : []);
 
 async function autosaveTick() {
-  if (!AUTOSAVE || saving || busy || !(bridge && peaReady)) return;
+  if (!AUTOSAVE || saving || busy || relayed.size || !isHost || !pageUp()) return;
   saving = true;
   try {
     const fp = await evalJs(FINGERPRINT, undefined, true);
@@ -204,7 +289,8 @@ async function autosaveTick() {
     for (const old of snapshots().slice(0, -KEEP_SNAPSHOTS)) fs.unlinkSync(path.join(SAVE_DIR, old));
   } catch (e) { log('autosave skipped:', e.message); } finally { saving = false; }
 }
-if (AUTOSAVE) setInterval(autosaveTick, AUTOSAVE_SECS * 1000).unref();
+let autosaveTimer = null;
+function startAutosave() { if (AUTOSAVE && !autosaveTimer) autosaveTimer = setInterval(autosaveTick, AUTOSAVE_SECS * 1000).unref(); }
 
 async function maybeRestore() {
   if (!AUTOSAVE) return;
@@ -215,7 +301,8 @@ async function maybeRestore() {
     if (docs !== 0) return; // page already has work open (e.g. server restarted); leave it alone
     const dataUrl = `data:application/octet-stream;base64,${fs.readFileSync(path.join(SAVE_DIR, latest)).toString('base64')}`;
     await runScript(`app.open(${J(dataUrl)});`, 90000, true);
-    await waitFor(async () => (await evalJs(`return app.documents.length;`, undefined, true)) > 0, 'the autosaved document to open');
+    await waitFor(async () => (await evalJs(`return app.documents.length ? app.activeDocument.layers.length : 0;`, undefined, true)) > 0, 'the autosaved document to open');
+    await sleep(800); // let Photopea finish rendering the restored layers before anything exports it
     lastFp = null; lastSnapshotAt = Date.now();
     log('restored', latest);
   } catch (e) { log('restore failed:', e.message); }
@@ -229,10 +316,10 @@ server.registerTool('photopea_status', {
   description: 'Bridge/Photopea state and active document info. Photopea tools auto-open the bridge page in the browser; launch=true opens it now.',
   inputSchema: { launch: z.boolean().optional() },
 }, tool(async ({ launch }) => {
-  if (launch) { lastLaunch = Date.now(); await launchBrowser(); }
-  if (!(bridge && peaReady)) return text({ connected: !!bridge, ready: peaReady, url: BRIDGE_URL });
+  if (launch) requestLaunch(true);
+  if (!pageUp()) return text({ connected: pageConnected(), ready: false, url: BRIDGE_URL });
   const doc = await evalJs(`${NUM} if(app.documents.length==0) return null; var d=app.activeDocument; return {name:d.name,w:__n(d.width),h:__n(d.height),dpi:d.resolution,layers:d.layers.length,docs:app.documents.length};`);
-  return text({ ready: true, doc });
+  return text({ ready: true, url: BRIDGE_URL, doc, ...(isHost ? {} : { shared: true }) });
 }));
 
 server.registerTool('photopea_new_document', {
@@ -417,7 +504,12 @@ server.registerTool('photopea_export', {
   },
 }, tool(async ({ format = 'png', quality = 0.92, filename, timeoutMs = 90000 }) => {
   const spec = format === 'jpg' || format === 'webp' ? `${format}:${quality}` : format;
-  const m = await runScript(`app.activeDocument.saveToOE(${J(spec)});`, timeoutMs);
+  let m;
+  for (let attempt = 0; attempt < 3; attempt++) { // right after a restore/open Photopea can briefly answer without a file
+    m = await runScript(`app.activeDocument.saveToOE(${J(spec)});`, timeoutMs);
+    if (m.buffers.length) break;
+    await sleep(900);
+  }
   if (!m.buffers.length) throw new Error('Photopea returned no file. Output: ' + JSON.stringify(m.outputs));
   const base = (filename || `poster-${new Date().toISOString().replace(/[:.]/g, '-')}`).replace(/[^\w.-]/g, '_');
   const file = path.join(OUT_DIR, `${base}.${format}`);
@@ -474,5 +566,6 @@ server.registerTool('icons_set_info', {
   return text({ name: j.name, license: j.license?.title, author: j.author?.name });
 }));
 
+await start(PORT);
 await server.connect(new StdioServerTransport());
 log('MCP server running on stdio');

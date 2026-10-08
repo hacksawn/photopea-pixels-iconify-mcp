@@ -28,7 +28,7 @@ connects with nothing open, the newest snapshot is reopened automatically. A tab
 Settings: `PHOTOPEA_MCP_AUTOSAVE=0` to turn it off, `PHOTOPEA_MCP_AUTOSAVE_SECS` (default 15). Autosave pauses while a tool call is running.
 
 ## Notes
-- If port 8787 is taken (another Claude session, a health check), the server uses the next free port and opens that URL. It exits when its MCP client disconnects, so no orphan keeps a port.
+- One shared bridge: the first server process hosts the Photopea tab on port 8787. Any other process (a second Claude session, `claude mcp list`, a script) detects that host and drives the same tab through it, so the URL never changes and no extra tabs open. If the host exits, a waiting process takes over the same port and the tab reconnects by itself with your document intact. Only if the port is held by an unrelated program does the server use the next free port. It also exits when its MCP client disconnects, so no orphan keeps a port.
 - Images are downloaded by the server and passed to Photopea as data URLs, so CORS is not an issue.
 - Photopea loads images and fonts asynchronously; the tools wait for them.
 - Pexels images are requested at ~1.5x the placed size from Pexels' CDN; downloads are cached in memory.
