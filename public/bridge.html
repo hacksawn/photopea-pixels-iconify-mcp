@@ -47,6 +47,23 @@ function pump(){
 }
 function send(o){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
 
+// Photopea's own SVG importer ignores filters/masks/patterns, so render SVG here with the browser engine and send PNG.
+function rasterize(msg){
+  const img = new Image();
+  const url = URL.createObjectURL(new Blob([msg.svg], {type: 'image/svg+xml;charset=utf-8'}));
+  img.onload = () => {
+    try {
+      const k = msg.scale || 1, c = document.createElement('canvas');
+      c.width = Math.round(msg.w * k); c.height = Math.round(msg.h * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      c.toBlob((b) => b.arrayBuffer().then((buf) => send({id: msg.id, png: b64(buf)})), 'image/png');
+    } catch (e) { send({id: msg.id, error: 'rasterize failed: ' + e}); }
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); send({id: msg.id, error: 'invalid SVG (could not be rendered)'}); };
+  img.src = url;
+}
+
 function connect(){
   ws = new WebSocket('ws://' + location.host + '/ws');
   ws.onopen = () => { flag($ws, true, 'connected'); if (ppReady) send({type:'photopea-ready'}); };
@@ -54,6 +71,7 @@ function connect(){
   ws.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.type === 'script') { queue.push({id: msg.id, script: msg.script, timeout: msg.timeout}); pump(); }
+    if (msg.type === 'raster') rasterize(msg);
   };
 }
 connect();

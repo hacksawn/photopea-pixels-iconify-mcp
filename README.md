@@ -14,6 +14,10 @@ Photopea: `photopea_status` (also opens the bridge), `photopea_new_document`, `p
 `photopea_list_layers`, `photopea_layer_edit`, `photopea_run_script`, `photopea_export`
 Assets: `pexels_search`, `icons_search`, `icons_set_info`
 
+`photopea_compose` ops: `rect`, `text`, `image` (URL), `icon` (Iconify) and `svg`. The `svg` op takes inline SVG markup and is rendered by the browser
+(not Photopea's own importer), so gradients, blur, drop shadows, masks, patterns and rounded shapes all work; use it for glass cards, glows and
+illustrations while text stays real, editable Photopea text. Text supports `tracking`, `lineHeight`, `rotate` and `opacity`; images and svgs support `rotate` and `opacity`.
+
 Export formats (all tested): png, jpg, webp, pdf, psd (layers kept), gif, bmp, tiff, ico, dds. SVG/AI/EPS/TGA did not work from a raster poster.
 Exports are saved to `./output` (override with `PHOTOPEA_MCP_OUTPUT`). Port: `PHOTOPEA_MCP_PORT` (default 8787).
 
@@ -24,6 +28,7 @@ connects with nothing open, the newest snapshot is reopened automatically. A tab
 Settings: `PHOTOPEA_MCP_AUTOSAVE=0` to turn it off, `PHOTOPEA_MCP_AUTOSAVE_SECS` (default 15). Autosave pauses while a tool call is running.
 
 ## Notes
+- If port 8787 is taken (another Claude session, a health check), the server uses the next free port and opens that URL. It exits when its MCP client disconnects, so no orphan keeps a port.
 - Images are downloaded by the server and passed to Photopea as data URLs, so CORS is not an issue.
 - Photopea loads images and fonts asynchronously; the tools wait for them.
 - Pexels images are requested at ~1.5x the placed size from Pexels' CDN; downloads are cached in memory.
